@@ -52,7 +52,7 @@ struct ContentView: View {
                         }
                 }
             }
-            .navigationTitle("Wochentage")
+            .navigationTitle("Notizliste")
             .toolbar {
                 ToolbarItem(placement: .bottomBar) {
                     Button(action: { addingNewItem = true }) {
