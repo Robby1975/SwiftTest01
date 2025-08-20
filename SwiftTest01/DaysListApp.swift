@@ -30,7 +30,7 @@ enum AuthError: LocalizedError {
 }
 
 struct AuthAPI {
-    /// <#Ersetze#> durch deine echte Basis-URL, z. B. "https://api.example.com"
+   
     static let BASE_URL = "https://schulessenapi.itsrs.de"
 
     /// Ruft /getAccess als POST auf. Erwartet JSON: { username, password }
@@ -60,6 +60,171 @@ struct AuthAPI {
     }
 }
 
+struct NotizRequest: Codable {
+    let userID: String
+    let notiz: String
+}
+
+
+struct NotizResponse: Codable {
+    let id: String
+    let userID: String
+    let notiz: String?
+    let aktiv: Bool
+    let letzteAktualisierung: Date   // wir parsen das ISO-Datum -> Date
+}
+
+enum APIError: LocalizedError {
+    case invalidURL
+    case badStatus(Int, String)
+    case noData
+    
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL: return "Die URL ist ungültig."
+        case .badStatus(let code, let body): return "Serverfehler (\(code)): \(body)"
+        case .noData: return "Keine Daten vom Server erhalten."
+        }
+    }
+}
+
+
+
+enum SchulessenAPIError: Error {
+    case ungültigeURL
+    case unerwarteterStatusCode(Int)
+}
+
+final class SchulessenAPI {
+    private let baseURL = URL(string: "https://schulessenapi.itsrs.de")!
+    private let session: URLSession
+    
+    init(session: URLSession = .shared) {
+        self.session = session
+    }
+    
+    /// Decoder, der ISO-8601 mit/ohne Millisekunden versteht
+    private static let jsonDecoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        
+        // Erst versuchen mit Millisekunden …
+        let isoFormatterMS = ISO8601DateFormatter()
+        isoFormatterMS.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        
+        // … dann ohne Millisekunden.
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime]
+        
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let str = try container.decode(String.self)
+            if let d = isoFormatterMS.date(from: str) { return d }
+            if let d = isoFormatter.date(from: str) { return d }
+            // Falls der Server mal ein anderes Format liefert:
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Ungültiges ISO-Datum: \(str)")
+        }
+        return decoder
+    }()
+    
+    /// Holt **eine** Notiz für einen Benutzer (falls Endpoint ein Objekt liefert)
+    func fetchNotiz(userID: String) async throws -> NotizResponse {
+        var url = baseURL
+        url.append(path: "/notizen/\(userID)")
+        // Alternativ per URLComponents bauen, wenn userID evtl. Sonderzeichen enthält
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw SchulessenAPIError.unerwarteterStatusCode(code)
+        }
+        return try Self.jsonDecoder.decode(NotizResponse.self, from: data)
+    }
+    
+    /// Holt **mehrere** Notizen (falls Endpoint eine Liste liefert)
+    func fetchNotizen(userID: String) async throws -> [NotizResponse] {
+        var url = baseURL
+        url.append(path: "/notizen/\(userID)")
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw SchulessenAPIError.unerwarteterStatusCode(code)
+        }
+        return try Self.jsonDecoder.decode([NotizResponse].self, from: data)
+    }
+}
+
+
+
+// MARK: - Notiz Service (async/await)
+final class NotizService {
+    private let endpoint = "https://schulessenapi.itsrs.de/notizen"
+    
+    /// ISO8601 mit Millisekunden (z. B. 2025-08-20T11:02:50.747)
+    private static let iso8601ms: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    
+    private func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        // Custom Date-Decoding für ISO8601 + fractional seconds
+        decoder.dateDecodingStrategy = .custom { dec in
+            let container = try dec.singleValueContainer()
+            let str = try container.decode(String.self)
+            if let d = NotizService.iso8601ms.date(from: str) {
+                return d
+            }
+            // Fallback ohne Millisekunden
+            let plain = ISO8601DateFormatter()
+            if let d2 = plain.date(from: str) {
+                return d2
+            }
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Ungültiges Datumsformat: \(str)")
+        }
+        return decoder
+    }
+    
+    private func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        // (Optional) schön fürs Debuggen
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        return encoder
+    }
+    
+    // Erstellt eine Notiz REST API CALL (POST /notizen)
+    func createNotiz(userID: String, notiz: String) async throws -> NotizResponse {
+        guard let url = URL(string: endpoint) else { throw APIError.invalidURL }
+        
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Falls nötig, hier z. B. ein Token setzen:
+        // req.setValue("Bearer <token>", forHTTPHeaderField: "Authorization")
+        
+        let body = NotizRequest(userID: userID , notiz: notiz)
+        req.httpBody = try makeEncoder().encode(body)
+        
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else { throw APIError.noData }
+        guard (200...299).contains(http.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? "<leer>"
+            throw APIError.badStatus(http.statusCode, text)
+        }
+        return try makeDecoder().decode(NotizResponse.self, from: data)
+    }
+}
+
+
 @MainActor
 final class AuthViewModel: ObservableObject {
     @Published var username = ""
@@ -69,6 +234,7 @@ final class AuthViewModel: ObservableObject {
 
     @AppStorage("authToken") private var storedToken: String = ""
     var isAuthenticated: Bool { !storedToken.isEmpty }
+    var token: String { storedToken }
 
     func login() async {
         errorText = nil
@@ -85,6 +251,26 @@ final class AuthViewModel: ObservableObject {
         } catch {
             errorText = (error as? LocalizedError)?.errorDescription ?? "Login fehlgeschlagen."
         }
+        
+        
+        let api = SchulessenAPI()
+
+        Task {
+            do {
+                // Falls der Endpoint EIN Objekt liefert:
+                //let notiz: NotizResponse = try await api.fetchNotiz(userID: "robert")
+                //print(notiz)
+
+                // Falls der Endpoint eine LISTE liefert:
+                let notizen: [NotizResponse] = try await api.fetchNotizen(userID: "robert")
+                print(notizen)
+            } catch {
+                print("Fehler: \(error)")
+            }
+        }
+
+        
+        
     }
 
     func logout() {
@@ -93,6 +279,57 @@ final class AuthViewModel: ObservableObject {
         password = ""
         errorText = nil
     }
+    
+    var subject: String? { JWT.subjectIfAny(from: token) }
+    
+    private struct JWTClaims: Decodable {
+        let sub: String?
+    }
+
+    enum JWT {
+        enum JWTError: Error {
+            case malformedToken
+            case badBase64
+            case badJSON
+            case missingSubject
+        }
+
+        /// Liest das "sub"-Claim (Subject) aus einem JWT oder "Bearer <jwt>".
+        static func subject(from token: String) throws -> String {
+            let cleaned = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw = cleaned.hasPrefix("Bearer ") ? String(cleaned.dropFirst(7)) : cleaned
+
+            let parts = raw.split(separator: ".")
+            guard parts.count >= 2 else { throw JWTError.malformedToken }
+
+            let payloadB64URL = String(parts[1])
+            guard let payloadData = base64URLDecode(payloadB64URL) else { throw JWTError.badBase64 }
+
+            let claims = try JSONDecoder().decode(JWTClaims.self, from: payloadData)
+            guard let sub = claims.sub, !sub.isEmpty else { throw JWTError.missingSubject }
+            return sub
+        }
+
+        /// Bequeme, nicht-werfende Variante.
+        static func subjectIfAny(from token: String) -> String? {
+            return (try? subject(from: token))
+        }
+
+        // MARK: - Base64URL → Data
+        private static func base64URLDecode(_ s: String) -> Data? {
+            var str = s.replacingOccurrences(of: "-", with: "+")
+                       .replacingOccurrences(of: "_", with: "/")
+            // Padding auf Vielfaches von 4
+            let pad = 4 - (str.count % 4)
+            if pad < 4 { str.append(String(repeating: "=", count: pad)) }
+            return Data(base64Encoded: str)
+        }
+    }
+
+    
+    
+    
+    
 }
 
 // MARK: - App Entry
@@ -172,7 +409,7 @@ struct LoginView: View {
     }
 }
 
-// MARK: - Dein bestehender Content
+
 
 struct DayItem: Identifiable, Equatable {
     let id: UUID
@@ -265,9 +502,31 @@ struct ContentView: View {
     private func addNew(name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        withAnimation { days.append(DayItem(id: UUID(), name: trimmed)) }
+        var myID=UUID()
+        
+        
+        let service = NotizService()
+
+        Task {
+            do {
+                let res = try await service.createNotiz(
+                    userID: auth.subject ?? "",
+                    notiz: trimmed
+                )
+                print("✅ Notiz erstellt:", res)
+                print("Aktualisiert am:", res.letzteAktualisierung)
+            } catch {
+                print("❌ Fehler:", error.localizedDescription)
+            }
+        }
+        withAnimation { days.append(DayItem(id: myID, name: trimmed)) }
     }
 }
+
+
+
+
+
 
 struct EditDayView: View {
     @State private var text: String
@@ -291,7 +550,7 @@ struct EditDayView: View {
                 Spacer()
             }
             .padding()
-            .navigationTitle("Bezeichnung bearbeiten")
+            .navigationTitle("Notiz bearbeiten")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Abbrechen", action: onCancel)
